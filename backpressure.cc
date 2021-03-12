@@ -74,18 +74,35 @@ class BackpressureMapper : public Mapping::NullMapper {
     assert(pq.count() == 1);
     Processor proc = pq.first();
 
-    for(size_t i = 0; i < task.regions.size(); i++) {
+    for (size_t i = 0; i < task.regions.size(); i++) {
       const RegionRequirement& req = task.regions[i];
       LayoutConstraintSet constraints;
       constraints.add_constraint(FieldConstraint(req.privilege_fields, false /*contiguous*/));
       std::vector<LogicalRegion> regions(1, req.region);
       Mapping::PhysicalInstance inst;
       bool created;
-      bool ok = runtime->find_or_create_physical_instance(ctx, mem, constraints, regions, inst, created);
-      if (!ok) {
-        log_app.error("failed allocation");
-        assert(false);
+      while (!runtime->find_or_create_physical_instance(ctx, mem, constraints, regions, inst, created)) {
+        log_app.info() << "Failed allocation for requirement " << i << " of task " << task.get_unique_id() << ", preparing to sleep"; std::cout.flush();
+        // Relase any instances we've acquired along the way
+        runtime->release_instances(ctx, output.chosen_instances);
+        // Get the event to wait on (a single event for all calls waiting on the same memory)
+        Mapping::MapperEvent event;
+        runtime->disable_reentrant(ctx);
+        if (!sysmem_wait_event_.exists() || runtime->has_mapper_event_triggered(ctx, sysmem_wait_event_)) {
+          sysmem_wait_event_ = runtime->create_mapper_event(ctx);
+        }
+        event = sysmem_wait_event_;
+        runtime->enable_reentrant(ctx);
+        // Sleep on the event
+        log_app.info() << "Failed allocation for requirement " << i << " of task " << task.get_unique_id() << ", going to sleep"; std::cout.flush();
+        runtime->wait_on_mapper_event(ctx, event);
+        log_app.info() << "Woke up, retrying allocation for requirement " << i << " of task " << task.get_unique_id(); std::cout.flush();
+        // Re-acquire all previously acquired instances
+        bool reacquired = runtime->acquire_instances(ctx, output.chosen_instances);
+        assert(reacquired);
+        // BUG: If we go through this loop the mapping succeeds, but the task never starts.
       }
+      log_app.info() << "Allocation success for requirement " << i << " of task " << task.get_unique_id(); std::cout.flush();
       output.chosen_instances[i].push_back(inst);
     }
 
@@ -95,16 +112,35 @@ class BackpressureMapper : public Mapping::NullMapper {
     runtime->find_valid_variants(ctx, task.task_id, valid_variants, proc.kind());
     assert(valid_variants.size() == 1);
     output.chosen_variant = valid_variants[0];
+    log_app.info() << "Done mapping task " << task.get_unique_id(); std::cout.flush();
+  }
 
-    // output.postmap_task = true;
+  // HACK: A callback that will be invoked after a task has run and its memory
+  // released. Ideally the runtime would wake up the mapper once some storage
+  // becomes available on a target memory.
+  void select_tunable_value(const Mapping::MapperContext ctx,
+                            const Task &task,
+                            const SelectTunableInput &input,
+                            SelectTunableOutput &output)
+  {
+    runtime->disable_reentrant(ctx);
+    if (sysmem_wait_event_.exists() && !runtime->has_mapper_event_triggered(ctx, sysmem_wait_event_)) {
+      runtime->trigger_mapper_event(ctx, sysmem_wait_event_);
+    }
+    runtime->enable_reentrant(ctx);
+    runtime->pack_tunable(1729, output);
+    log_app.info() << "Triggered mapper event"; std::cout.flush();
   }
 
   void configure_context(const Mapping::MapperContext ctx,
-			 const Task& task, ContextConfigOutput& output)
+                         const Task &task,
+                         ContextConfigOutput &output)
   {
     // defaults
   }
 
+ private:
+  Mapping::MapperEvent sysmem_wait_event_;
 };
 
 void mapper_registration(Machine machine, Runtime *rt,
@@ -117,7 +153,9 @@ void task_test(const Task *task,
                const std::vector<PhysicalRegion> &regions,
                Context ctx, Runtime *runtime)
 {
+  log_app.info() << "task starting"; std::cout.flush();
   std::this_thread::sleep_for(std::chrono::seconds(1));
+  log_app.info() << "task exiting"; std::cout.flush();
 }
 
 void task_top_level(const Task *task,
@@ -125,6 +163,8 @@ void task_top_level(const Task *task,
                     Context ctx, Runtime *runtime)
 {
   int N = 3;
+  std::vector<Future> results;
+  // std::vector<LogicalRegion> _regions;
   for (int i = 0; i < N; ++i) {
     Rect<1> bounds(0, (1<<20)-1); // 1MB
     IndexSpace is = runtime->create_index_space(ctx, bounds);
@@ -136,8 +176,24 @@ void task_top_level(const Task *task,
     launcher.add_region_requirement(
       RegionRequirement(lr, LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE, lr)
       .add_field(FID_DATA));
-    runtime->execute_task(ctx, launcher);
+    results.push_back(runtime->execute_task(ctx, launcher));
     runtime->destroy_logical_region(ctx, lr);
+    // Could instead wait for the task to return and delete the region then.
+    // _regions.push_back(lr);
+  }
+  // HACK: After a task finishes (and its instance has hopefully been marked as
+  // collectable), wake up the mapper to try the mapping again. This should
+  // really wait on any task to finish, it won't necessarily be the next one in
+  // launch order.
+  for (int i = 0; i < N-1; ++i) {
+    log_app.info() << "Waiting for next task to finish"; std::cout.flush();
+    results[i].get_void_result();
+    // BUG: If I destroy the task's region here then the instance is not collected.
+    // runtime->destroy_logical_region(ctx, _regions[i]);
+    log_app.info() << "Waiting a second for instance to be collected"; std::cout.flush();
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    log_app.info() << "Waking up the mapper"; std::cout.flush();
+    runtime->select_tunable_value(ctx, 42);
   }
 }
 
